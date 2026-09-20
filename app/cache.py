@@ -1,23 +1,32 @@
 # app/cache.py
-import time
 import json
+import time
 from collections import OrderedDict
-from typing import Optional, Dict, Any
-from .config import CACHE_TTL_SECONDS, CACHE_MAX_BYTES
+
 from . import stats
+from .config import CACHE_MAX_BYTES, CACHE_TTL_SECONDS
 
 
 class QuoteCache:
+    """
+    LRU-кэш с TTL и лимитом по байтам.
+
+    Хранит значения как raw JSON-байты (bytes), чтобы экономить память
+    и отдавать их в HTTP-ответ без повторной сериализации.
+    """
+
     def __init__(self, max_bytes: int = CACHE_MAX_BYTES, ttl: int = CACHE_TTL_SECONDS):
-        self.cache: OrderedDict = OrderedDict()
+        self.cache: OrderedDict[str, tuple[bytes, float, int]] = OrderedDict()
         self.max_bytes = max_bytes
         self.ttl = ttl
         self.current_bytes = 0
 
-    def _get_size(self, item: dict) -> int:
-        return len(json.dumps(item).encode('utf-8'))
+    def _get_size(self, item) -> int:
+        if isinstance(item, bytes):
+            return len(item)
+        return len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
 
-    def get(self, key: str) -> Optional[dict]:
+    def get(self, key: str) -> bytes | None:
         if key not in self.cache:
             return None
         data, expiry, size = self.cache[key]
@@ -27,13 +36,17 @@ class QuoteCache:
         self.cache.move_to_end(key)
         return data
 
-    def put(self, key: str, data: dict):
+    def put(self, key: str, data):
+        """Принимает dict или bytes. Внутри всегда хранит bytes."""
         if key in self.cache:
             self.invalidate(key)
 
+        if isinstance(data, dict):
+            data = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
         size = self._get_size(data)
         if size > self.max_bytes:
-            return
+            return  # не влезает даже пустой кэш
 
         self.cache[key] = (data, time.time() + self.ttl, size)
         self.current_bytes += size
@@ -41,7 +54,7 @@ class QuoteCache:
         self._sync_stats()
 
     def invalidate(self, key: str):
-        """Удаление без инкремента evictions (для ручного сброса)"""
+        """Удаление без инкремента evictions (ручной сброс)."""
         if key in self.cache:
             _, _, size = self.cache.pop(key)
             self.current_bytes -= size
