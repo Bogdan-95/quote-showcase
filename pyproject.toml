@@ -1,6 +1,6 @@
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP"]
@@ -8,4 +8,4 @@ ignore = ["E501"]  # длину строк контролирует black
 
 [tool.black]
 line-length = 100
-target-version = ["py311"]
+target-version = ["py312"]

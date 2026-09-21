@@ -9,3 +9,4 @@ CLAUDE.md
 *.md
 .ruff_cache/
 .pytest_cache/
+docs/
