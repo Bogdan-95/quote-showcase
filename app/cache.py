@@ -67,8 +67,7 @@ class QuoteCache:
 
     def _evict_if_needed(self) -> None:
         while self.current_bytes > self.max_bytes and self.cache:
-            oldest_key, (_, _, size) = self.cache.popitem(last=False)
-            del oldest_key
+            _, (_, _, size) = self.cache.popitem(last=False)
             self.current_bytes -= size
             stats.STATS["evictions"] += 1
 

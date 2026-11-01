@@ -79,7 +79,7 @@ async def read_quote(quote_id: str) -> Response:
         )
 
 
-@router.post("/import")
+@router.post("/import", response_model=None)
 async def import_snapshot(request: Request) -> dict[str, int] | JSONResponse:
     try:
         imported, dropped = await import_catalog_stream(request.stream())
