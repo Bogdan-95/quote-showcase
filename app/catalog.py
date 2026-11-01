@@ -1,106 +1,135 @@
-# app/catalog.py
+"""In-memory catalog and validated streaming snapshot import."""
+
+import asyncio
 import json
+import tempfile
+from typing import Any
 
 from . import stats
 
-# Храним raw JSON-байты записи, а не dict — экономит ~50% памяти.
+# Raw JSON bytes avoid retaining a Python dict for every catalog record.
 CATALOG: dict[str, bytes] = {}
 
 
 def get_quote_from_catalog(quote_id: str) -> bytes | None:
-    """Возвращает raw JSON-байты записи или None."""
     return CATALOG.get(quote_id)
 
 
-def put_quote_to_catalog(quote_id: str, quote_data: dict):
-    """PUT /catalog/{id} — сериализуем dict в JSON-байты для хранения."""
+def put_quote_to_catalog(quote_id: str, quote_data: dict[str, Any]) -> None:
     raw = json.dumps(quote_data, ensure_ascii=False).encode("utf-8")
     CATALOG[quote_id] = raw
     stats.update_catalog_stats(len(CATALOG))
 
 
 def delete_quote_from_catalog(quote_id: str) -> bool:
-    if quote_id in CATALOG:
-        del CATALOG[quote_id]
-        stats.update_catalog_stats(len(CATALOG))
-        return True
-    return False
+    if quote_id not in CATALOG:
+        return False
+
+    del CATALOG[quote_id]
+    stats.update_catalog_stats(len(CATALOG))
+    return True
 
 
-async def _iter_lines(byte_stream):
-    """Разбивает async-поток байтов на строки, буферизуя остатки."""
-    buffer = b""
-    async for chunk in byte_stream:
-        buffer += chunk
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            yield line
-    if buffer:
-        yield buffer
+def _parse_record(raw_line: bytes, line_number: int) -> tuple[str, bytes]:
+    line = raw_line.strip()
+    if line.endswith(b","):
+        line = line[:-1].rstrip()
+
+    try:
+        item = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON in record on line {line_number}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(item, dict):
+        raise ValueError(f"Record on line {line_number} must be a JSON object")
+
+    quote_id = item.get("id")
+    author = item.get("author")
+    quote_text = item.get("text")
+    if not isinstance(quote_id, str) or not quote_id:
+        raise ValueError(f"Record on line {line_number} has an invalid id")
+    if not isinstance(author, str):
+        raise ValueError(f"Record on line {line_number} has an invalid author")
+    if not isinstance(quote_text, str):
+        raise ValueError(f"Record on line {line_number} has an invalid text")
+
+    return quote_id, line
 
 
-async def import_catalog_stream(stream_reader) -> tuple:
+async def import_catalog_stream(stream_reader) -> tuple[int, int]:
+    """Validate a full snapshot before changing the in-memory catalog.
+
+    The request body is spooled to disk after a small in-memory threshold.
+    A first pass validates every record and collects IDs. A second pass
+    updates the current dictionary in-place to avoid holding two full
+    catalog dictionaries in memory at once.
     """
-    Стриминговый парсинг JSON-снимка.
+    with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b") as snapshot:
+        async for chunk in stream_reader:
+            snapshot.write(chunk)
 
-    Формат гарантирован заданием:
-    - Первая строка: {"quotes":[
-    - Далее по одной записи в строке, записи разделены запятой в конце строки
-    - Последняя строка: ]}
+        snapshot.seek(0)
+        first_line = snapshot.readline().strip()
+        if first_line != b'{"quotes":[':
+            raise ValueError('Invalid format: expected {"quotes":[ as the first line')
 
-    Парсим построчно — в памяти всегда только одна цитата (~16 КБ max).
-    Храним raw JSON-байты, чтобы не тратить память на dict.
+        seen_ids: set[str] = set()
+        imported = 0
+        line_number = 1
+        closed = False
 
-    Каталог обновляется in-place: новые записи перезаписываются сразу,
-    после чего удаляются те, что не пришли в снимке. Так избегаем
-    одновременного хранения старого и нового каталога (пик памяти ×2).
-    """
-    imported = 0
-    line_num = 0
-    seen_ids: set[str] = set()
+        while True:
+            raw_line = snapshot.readline()
+            if not raw_line:
+                break
 
-    async for raw_line in _iter_lines(stream_reader):
-        line_num += 1
-        line = raw_line.strip()
-        if not line:
-            continue
+            line_number += 1
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == b"]}":
+                closed = True
+                break
 
-        # Первая строка — префикс {"quotes":[
-        if line_num == 1:
-            if not line.startswith(b"{"):
-                raise ValueError("Invalid format: expected JSON object start")
-            continue
+            quote_id, _ = _parse_record(line, line_number)
+            if quote_id in seen_ids:
+                raise ValueError(f"Duplicate quote id on line {line_number}: {quote_id}")
+            seen_ids.add(quote_id)
+            imported += 1
 
-        # Последняя строка — ]}
-        if line == b"]}":
-            break
+        if not closed:
+            raise ValueError("Invalid format: missing closing ]} line")
+        if snapshot.read().strip():
+            raise ValueError("Invalid format: unexpected data after closing ]}")
 
-        # Убираем trailing comma
-        if line.endswith(b","):
-            line = line[:-1]
+        # Only a completely validated snapshot reaches this mutation phase.
+        snapshot.seek(0)
+        snapshot.readline()
+        applied = 0
+        while True:
+            raw_line = snapshot.readline()
+            if not raw_line:
+                break
 
-        # Парсим одну запись — только для валидации, в каталог пойдут сырые байты
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in record #{line_num}: {str(e)}")
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == b"]}":
+                break
 
-        if not isinstance(item, dict):
-            raise ValueError(f"Record #{line_num} is not an object")
-        if "id" not in item or "author" not in item or "text" not in item:
-            raise ValueError(f"Record #{line_num} missing required fields")
+            quote_id, raw_record = _parse_record(line, applied + 2)
+            CATALOG[quote_id] = raw_record
+            applied += 1
 
-        quote_id = item["id"]
-        CATALOG[quote_id] = line  # in-place, raw bytes
-        seen_ids.add(quote_id)
-        imported += 1
+            if applied % 1000 == 0:
+                await asyncio.sleep(0)
 
-    # Удаляем записи, которых не было в новом снимке
-    dropped = 0
-    for old_id in list(CATALOG.keys()):
-        if old_id not in seen_ids:
-            del CATALOG[old_id]
-            dropped += 1
+        stale_ids = [quote_id for quote_id in CATALOG if quote_id not in seen_ids]
+        for quote_id in stale_ids:
+            del CATALOG[quote_id]
 
+    dropped = len(stale_ids)
     stats.update_catalog_stats(len(CATALOG))
     return imported, dropped
